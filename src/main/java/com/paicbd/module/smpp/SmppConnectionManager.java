@@ -6,6 +6,7 @@ import com.paicbd.smsc.cdr.CdrProcessor;
 import com.paicbd.smsc.dto.ErrorCodeMapping;
 import com.paicbd.smsc.dto.Gateway;
 import com.paicbd.smsc.dto.MessageEvent;
+import com.paicbd.smsc.dto.MessagePart;
 import com.paicbd.smsc.dto.UtilsRecords;
 import com.paicbd.smsc.exception.NoAvailableSessionException;
 import com.paicbd.smsc.kafka.KafkaConsumerConstants;
@@ -17,6 +18,9 @@ import com.paicbd.smsc.kafka.KafkaUtils;
 import com.paicbd.smsc.scylla.ScyllaManager;
 import com.paicbd.smsc.scylla.ScyllaTablesConstants;
 import com.paicbd.smsc.utils.ChargingUtils;
+import com.paicbd.smsc.utils.multipart.MultipartPartStatuses;
+import com.paicbd.smsc.utils.multipart.MultipartRetryMode;
+import com.paicbd.smsc.utils.multipart.MultipartRetryPolicy;
 import com.paicbd.smsc.utils.Converter;
 import com.paicbd.smsc.utils.EncodingUtils;
 import com.paicbd.smsc.utils.ErrorCodes;
@@ -65,6 +69,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
+import static com.paicbd.module.utils.Constants.CDR_COMMENT;
+import static com.paicbd.module.utils.Constants.SKIPPED_PART_COMMENT;
 import static com.paicbd.module.utils.Constants.PARAM_UPDATE_SESSIONS;
 import static com.paicbd.module.utils.Constants.PARAM_UPDATE_STATUS;
 import static com.paicbd.module.utils.Constants.STOPPED;
@@ -229,6 +235,7 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
 
     private void startConsumer() {
         this.startSenderScheduler();
+        this.initializeConsumers();
         this.startConsumers();
         this.startProcessor();
         log.info("Started priority consumers and processor for gateway {}", gateway.getSystemId());
@@ -329,7 +336,6 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
     }
 
     public void connect() {
-        this.initializeConsumers();
         this.stopped = false;
         this.submitSmWatcher = new Watcher("SmppClient:OutboundSubmitSm-NetworkId-" + this.gateway.getNetworkId() + "-", this.requestCounterTotal, 1);
         if (Objects.isNull(this.schedulerRetryBind)) {
@@ -481,8 +487,8 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
                     submitSmEvent.isApplyForRefund(),
                     submitSmEvent.getCustomParams(),
                     submitSmEvent.isSplitForSmsc(),
-                    submitSmEvent.getSourceUri(),
-                    submitSmEvent.getDestinationUri(),
+                    submitSmEvent.getSource(),
+                    submitSmEvent.getDestination(),
                     submitSmEvent.getSmscMessagePriority()
             );
             this.scyllaManager.insertIntoTable(ScyllaTablesConstants.SMPP_SUBMIT_SM_RESULT_TABLE,
@@ -509,8 +515,7 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
     }
 
     private void handleRetryAlternateDestination(MessageEvent originalSubmitSmEventToRetry) {
-        this.cdrProcessor.publishCdr(originalSubmitSmEventToRetry, UtilsEnum.Module.SMPP_CLIENT,
-                UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.FAILED, kafkaTemplate);
+        this.publishFailedCdr(originalSubmitSmEventToRetry);
         MessageEvent submitSmEventToRetry = Converter.deepCopy(originalSubmitSmEventToRetry, MessageEvent.class);
         this.prepareForRetry(submitSmEventToRetry);
         String kafkaTopic = KafkaUtils.getRoutingTopicPriority(submitSmEventToRetry.getSmscMessagePriority());
@@ -522,8 +527,7 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
         log.debug("AutoRetryErrorCodes defined {}, ReceivedErrorCode {}", gateway.getAutoRetryErrorCode(), errorCode);
         if (errorContained(gateway.getAutoRetryErrorCode(), errorCode)) {
             log.warn("AutoRetrying for submit_sm with id {}", submitSmEventToRetry.getMessageId());
-            this.cdrProcessor.publishCdr(submitSmEventToRetry, UtilsEnum.Module.SMPP_CLIENT,
-                    UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.FAILED, kafkaTemplate);
+            this.publishFailedCdr(submitSmEventToRetry);
             this.prepareForRetry(submitSmEventToRetry);
             String topicRetries = KafkaUtils.getRetriesTopicPriority(submitSmEventToRetry.getSmscMessagePriority());
             kafkaTemplate.send(topicRetries, submitSmEventToRetry.toString());
@@ -550,6 +554,8 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
             if (!submitSmEventToRetry.isFinalSegmentForSplitSmsc()) return;
             ErrorCodeMapping errorCodeMapping = getErrorCodeMapping(errorCode);
             MessageEvent deliverSmEvent = submitSmEventToRetry.createDeliveryReceiptMessage(errorCodeMapping, null);
+            deliverSmEvent.addCustomParam(CDR_COMMENT,
+                    ErrorCodes.getErrorDescription(UtilsEnum.Module.SMPP_CLIENT, errorCode, null));
             this.kafkaTemplate.send(KafkaTopicsConstants.PRE_DELIVER_TOPIC, deliverSmEvent.toString());
         }
     }
@@ -573,22 +579,8 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
         for (MessageEvent submitSmEvent : events) {
             CompletableFuture.runAsync(() -> {
                 try {
-                    if (submitSmEvent.getMessageParts() != null) {
-                        submitSmEvent.getMessageParts().forEach(msgPart -> {
-                            MessageEvent messageEvent = Converter.deepCopy(submitSmEvent, MessageEvent.class);
-                            messageEvent.setMessageId(msgPart.getMessageId());
-                            messageEvent.setShortMessage(msgPart.getShortMessage());
-                            messageEvent.setMsgReferenceNumber(msgPart.getMsgReferenceNumber());
-                            messageEvent.setTotalSegment(msgPart.getTotalSegment());
-                            messageEvent.setSegmentSequence(msgPart.getSegmentSequence());
-                            messageEvent.setOptionalParameters(msgPart.getOptionalParameters());
-                            messageEvent.setMessageBytes(msgPart.getPartBytes());
-                            messageEvent.setUdhBytes(msgPart.getUdhBytes());
-                            messageEvent.setUdhRaw(msgPart.getUdhRaw());
-                            messageEvent.addCustomParam(msgPart.getCustomParams());
-                            this.prepareConcatenatedSmsIfNeeded(messageEvent);
-                            sendMessage(messageEvent);
-                        });
+                    if (hasMessageParts(submitSmEvent)) {
+                        sendMultipartMessage(submitSmEvent);
                     } else {
                         sendMessage(submitSmEvent);
                     }
@@ -599,42 +591,196 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
         }
     }
 
+    private static boolean hasMessageParts(MessageEvent submitSmEvent) {
+        return Objects.nonNull(submitSmEvent.getMessageParts()) && !submitSmEvent.getMessageParts().isEmpty();
+    }
+
+    private static boolean isSplitParent(MessageEvent submitSmEvent) {
+        return hasMessageParts(submitSmEvent) && Objects.isNull(submitSmEvent.getSegmentSequence());
+    }
+
+    private void publishSkippedPartsCdr(MessageEvent submitSmEvent) {
+        if (!hasMessageParts(submitSmEvent)) {
+            return;
+        }
+
+        List<MessagePart> pendingParts =
+                new ArrayList<>(MultipartRetryPolicy.orderBySegmentSequence(submitSmEvent.getPendingMessageParts()));
+        if (pendingParts.isEmpty()) {
+            return;
+        }
+
+        if (submitSmEvent.isSplitForSmsc() && !appProperties.isSmscGenerateCdrWhenSplitSmsc()) {
+            log.warn("Skipping CDR for the unsent parts of parentId {} because the message was split by the SMSC",
+                    submitSmEvent.getParentId());
+            return;
+        }
+
+        MessagePart alreadyReportedPart = pendingParts.get(0);
+        for (MessagePart messagePart : pendingParts) {
+            if (Objects.equals(messagePart.getSegmentSequence(), alreadyReportedPart.getSegmentSequence())) {
+                continue;
+            }
+            log.info("Creating CDR for skipped part {} of {} with parentId {} using error code {}",
+                    messagePart.getSegmentSequence(), messagePart.getTotalSegment(),
+                    submitSmEvent.getParentId(), ErrorCodes.PART_SKIPPED_PREVIOUS_FAILURE);
+            MessageEvent skippedPart = buildEventForMessagePart(submitSmEvent, messagePart);
+            skippedPart.setMessageParts(null);
+            skippedPart.setErrorCode(ErrorCodes.PART_SKIPPED_PREVIOUS_FAILURE);
+            this.cdrProcessor.publishCdr(skippedPart, "", UtilsEnum.Module.SMPP_CLIENT,
+                    UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.FAILED, SKIPPED_PART_COMMENT, kafkaTemplate);
+        }
+    }
+
+    private void publishFailedCdr(MessageEvent submitSmEvent) {
+        if (isSplitParent(submitSmEvent)) {
+            log.debug("Skipping CDR for multipart parent {}, each attempted part reports its own",
+                    submitSmEvent.getMessageId());
+            return;
+        }
+        this.cdrProcessor.publishCdr(submitSmEvent, UtilsEnum.Module.SMPP_CLIENT,
+                UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.FAILED, kafkaTemplate);
+    }
+
+    private void sendMultipartMessage(MessageEvent submitSmEvent) {
+        List<MessagePart> orderedParts =
+                new ArrayList<>(MultipartRetryPolicy.orderBySegmentSequence(submitSmEvent.getMessageParts()));
+        submitSmEvent.setMessageParts(orderedParts);
+
+        MultipartRetryMode retryMode = MultipartRetryPolicy.resolve(submitSmEvent);
+        boolean resumeFromFailedPart = MultipartRetryPolicy.shouldResumeFromFailedPart(submitSmEvent);
+
+        if (!resumeFromFailedPart) {
+            MultipartPartStatuses.markAllAsNotSent(submitSmEvent);
+        }
+
+        int startSegment = resumeFromFailedPart
+                ? MultipartRetryPolicy.resolveResumeSegment(submitSmEvent, orderedParts)
+                : MultipartRetryPolicy.FIRST_SEGMENT;
+
+        if (resumeFromFailedPart) {
+            MultipartPartStatuses.markAsNotSentFromSegment(submitSmEvent, startSegment);
+        }
+
+        if (submitSmEvent.isRetry()) {
+            log.info("Retrying multipart SMPP message with parentId {} in mode {} from segment {}, sent flags {}",
+                    submitSmEvent.getParentId(), retryMode, startSegment,
+                    MultipartPartStatuses.sentFlags(submitSmEvent));
+        }
+
+        for (MessagePart messagePart : orderedParts) {
+            Integer segmentSequence = messagePart.getSegmentSequence();
+            if (Objects.isNull(segmentSequence)) {
+                log.warn("Ignoring multipart part without segment sequence for parentId {}", submitSmEvent.getParentId());
+                continue;
+            }
+            if (segmentSequence < startSegment) {
+                log.debug("Skipping segment {} of parentId {} because it was already delivered",
+                        segmentSequence, submitSmEvent.getParentId());
+                continue;
+            }
+
+            MessageEvent partEvent = buildEventForMessagePart(submitSmEvent, messagePart);
+            if (!sendMessagePart(partEvent)) {
+                MultipartPartStatuses.markAsNotSent(submitSmEvent, segmentSequence);
+                log.warn("Stopping multipart transmission for parentId {} at segment {} of {}",
+                        submitSmEvent.getParentId(), segmentSequence, messagePart.getTotalSegment());
+                this.handleMultipartFailure(submitSmEvent, partEvent);
+                return;
+            }
+            MultipartPartStatuses.markAsSent(submitSmEvent, segmentSequence);
+        }
+        ChargingUtils.publishChargingCompletion(submitSmEvent, true, kafkaTemplate);
+    }
+
+    private MessageEvent buildEventForMessagePart(MessageEvent submitSmEvent, MessagePart messagePart) {
+        MessageEvent partEvent = Converter.deepCopy(submitSmEvent, MessageEvent.class);
+        partEvent.setMessageId(messagePart.getMessageId());
+        partEvent.setShortMessage(messagePart.getShortMessage());
+        partEvent.setMsgReferenceNumber(messagePart.getMsgReferenceNumber());
+        partEvent.setTotalSegment(messagePart.getTotalSegment());
+        partEvent.setSegmentSequence(messagePart.getSegmentSequence());
+        partEvent.setOptionalParameters(messagePart.getOptionalParameters());
+        partEvent.setMessageBytes(messagePart.getPartBytes());
+        partEvent.setUdhBytes(messagePart.getUdhBytes());
+        partEvent.setUdhRaw(messagePart.getUdhRaw());
+        partEvent.addCustomParam(messagePart.getCustomParams());
+        this.prepareConcatenatedSmsIfNeeded(partEvent);
+        return partEvent;
+    }
+
+    private boolean sendMessagePart(MessageEvent partEvent) {
+        try {
+            this.submitShortMessage(partEvent);
+            return true;
+        } catch (Exception e) {
+            partEvent.setErrorCode(handleException(e, partEvent));
+            sendProxyResponse(kafkaTemplate, partEvent, UtilsEnum.CdrStatus.FAILED);
+            return false;
+        }
+    }
+
+    private void handleMultipartFailure(MessageEvent submitSmEvent, MessageEvent failedPartEvent) {
+        int errorCode = failedPartEvent.getErrorCode();
+        MessageEvent failedPartCdr = Converter.deepCopy(failedPartEvent, MessageEvent.class);
+        failedPartCdr.setMessageParts(null);
+        this.publishFailedCdr(failedPartCdr);
+
+        submitSmEvent.setErrorCode(errorCode);
+        ChargingUtils.publishChargingCompletion(submitSmEvent, false, kafkaTemplate);
+
+        if (submitSmEvent.getValidityPeriod() == 0 || submitSmEvent.isLastRetry()) {
+            log.debug("Finishing multipart transaction for message {} with error code {}",
+                    submitSmEvent.getMessageId(), errorCode);
+            this.handlerFailedMessage(submitSmEvent, errorCode);
+            return;
+        }
+
+        this.sendToRetryProcess(submitSmEvent, errorCode);
+    }
+
     private void sendMessage(MessageEvent submitSmEvent) {
         try {
-            DataCoding dataCoding = EncodingUtils.getDataCoding(submitSmEvent.getDataCoding());
-            int encodingType = SmppUtils.determineEncodingType(submitSmEvent.getDataCoding(), this.gateway);
-            byte[] encodedShortMessage = buildMessageBytesToDeliver(submitSmEvent, encodingType);
-
-            OptionalParameter[] parameters = Objects.nonNull(submitSmEvent.getOptionalParameters()) ?
-                    SmppUtils.getTLV(submitSmEvent) : new OptionalParameter[0];
-            SubmitSmResult submitSmResult = this.getRandomSession().submitShortMessage(
-                    submitSmEvent.getServiceType(),
-                    UtilsEnum.getTypeOfNumber(submitSmEvent.getSourceAddrTon()),
-                    UtilsEnum.getNumberingPlanIndicator(submitSmEvent.getSourceAddrNpi()),
-                    submitSmEvent.getSourceAddr(),
-                    UtilsEnum.getTypeOfNumber(submitSmEvent.getDestAddrTon()),
-                    UtilsEnum.getNumberingPlanIndicator(submitSmEvent.getDestAddrNpi()),
-                    submitSmEvent.getDestinationAddr(),
-                    new ESMClass(submitSmEvent.getEsmClass()),
-                    submitSmEvent.getProtocolId(),
-                    submitSmEvent.getPriorityFlag(),
-                    submitSmEvent.getScheduleDeliveryTime(),
-                    submitSmEvent.getStringValidityPeriod(),
-                    new RegisteredDelivery(submitSmEvent.getRegisteredDelivery()),
-                    submitSmEvent.getReplaceIfPresent(),
-                    dataCoding,
-                    (byte) submitSmEvent.getSmDefaultMsgId(),
-                    encodedShortMessage,
-                    parameters);
-            sendProxyResponse(kafkaTemplate, submitSmEvent, UtilsEnum.CdrStatus.SUCCESS);
-            requestCounterTotal.incrementAndGet();
-            addInCache(submitSmEvent.getRegisteredDelivery(), submitSmEvent, submitSmResult);
-            cdrProcessor.publishCdr(submitSmEvent, submitSmResult.getMessageId(), UtilsEnum.Module.SMPP_CLIENT,
-                    UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.SUCCESS, kafkaTemplate);
+            this.submitShortMessage(submitSmEvent);
+            ChargingUtils.publishChargingCompletion(submitSmEvent, true, kafkaTemplate);
         } catch (Exception e) {
             handleExceptionForErrorOnSendSubmitSm(submitSmEvent, e);
             sendProxyResponse(kafkaTemplate, submitSmEvent, UtilsEnum.CdrStatus.FAILED);
         }
+    }
+
+    private void submitShortMessage(MessageEvent submitSmEvent)
+            throws PDUException, ResponseTimeoutException, InvalidResponseException, NegativeResponseException, IOException {
+        DataCoding dataCoding = EncodingUtils.getDataCoding(submitSmEvent.getDataCoding());
+        int encodingType = SmppUtils.determineEncodingType(submitSmEvent.getDataCoding(), this.gateway);
+        byte[] encodedShortMessage = buildMessageBytesToDeliver(submitSmEvent, encodingType);
+
+        OptionalParameter[] parameters = Objects.nonNull(submitSmEvent.getOptionalParameters()) ?
+                SmppUtils.getTLV(submitSmEvent) : new OptionalParameter[0];
+        SubmitSmResult submitSmResult = this.getRandomSession().submitShortMessage(
+                submitSmEvent.getServiceType(),
+                UtilsEnum.getTypeOfNumber(submitSmEvent.getSourceAddrTon()),
+                UtilsEnum.getNumberingPlanIndicator(submitSmEvent.getSourceAddrNpi()),
+                submitSmEvent.getSourceAddr(),
+                UtilsEnum.getTypeOfNumber(submitSmEvent.getDestAddrTon()),
+                UtilsEnum.getNumberingPlanIndicator(submitSmEvent.getDestAddrNpi()),
+                submitSmEvent.getDestinationAddr(),
+                new ESMClass(submitSmEvent.getEsmClass()),
+                submitSmEvent.getProtocolId(),
+                submitSmEvent.getPriorityFlag(),
+                submitSmEvent.getScheduleDeliveryTime(),
+                submitSmEvent.getStringValidityPeriod(),
+                new RegisteredDelivery(submitSmEvent.getRegisteredDelivery()),
+                submitSmEvent.getReplaceIfPresent(),
+                dataCoding,
+                (byte) submitSmEvent.getSmDefaultMsgId(),
+                encodedShortMessage,
+                parameters);
+        sendProxyResponse(kafkaTemplate, submitSmEvent, UtilsEnum.CdrStatus.SUCCESS);
+        requestCounterTotal.incrementAndGet();
+        addInCache(submitSmEvent.getRegisteredDelivery(), submitSmEvent, submitSmResult);
+        cdrProcessor.publishCdr(submitSmEvent, submitSmResult.getMessageId(), UtilsEnum.Module.SMPP_CLIENT,
+                UtilsEnum.MessageType.MESSAGE, UtilsEnum.CdrStatus.SUCCESS, kafkaTemplate);
     }
 
     private void sendProxyResponse(KafkaTemplate<String, String> kafkaTemplate, MessageEvent event, UtilsEnum.CdrStatus cdrStatus) {
@@ -676,6 +822,8 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
                 submitSmEvent.getMessageId(), errorHandlingResult,
                 submitSmEvent.getValidityPeriod(), submitSmEvent.isLastRetry());
 
+        ChargingUtils.publishChargingCompletion(submitSmEvent, false, kafkaTemplate);
+
         if (submitSmEvent.getValidityPeriod() == 0) {
             this.handlerFailedMessage(submitSmEvent, errorHandlingResult);
             log.debug("An error occurred while sending submit_sm with id {}. The validity period is 0, finishing the transaction", submitSmEvent.getMessageId());
@@ -692,9 +840,14 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
     }
 
     private void handlerFailedMessage(MessageEvent submitSmEvent, int errorCode) {
-        this.cdrProcessor.publishCdr(submitSmEvent, UtilsEnum.Module.SMPP_CLIENT, UtilsEnum.MessageType.MESSAGE,
-                UtilsEnum.CdrStatus.FAILED, kafkaTemplate);
+        submitSmEvent.setErrorCode(errorCode);
+        this.publishFailedCdr(submitSmEvent);
+        this.publishSkippedPartsCdr(submitSmEvent);
         this.sendDeliverSmForFailedCases(submitSmEvent, errorCode);
+        this.applyRefundIfNeeded(submitSmEvent);
+    }
+
+    private void applyRefundIfNeeded(MessageEvent submitSmEvent) {
         if (ChargingUtils.checkMessageForRefund(submitSmEvent)) {
             log.debug("Applying refund for message with id {}", submitSmEvent.getMessageId());
             String topicByPriority = KafkaUtils.getChargingTopicPriority(submitSmEvent.getSmscMessagePriority());
@@ -715,7 +868,7 @@ public class SmppConnectionManager extends KafkaConsumerHandler {
     }
 
     public static String cleanAndUpperString(String messageId) {
-        return messageId.replaceFirst("^0+", "").toUpperCase();
+        return messageId.replaceAll("[\\s\\p{Cntrl}]+", "").replaceFirst("^0+", "").toUpperCase();
     }
 
     private void prepareConcatenatedSmsIfNeeded(MessageEvent messageEvent) {

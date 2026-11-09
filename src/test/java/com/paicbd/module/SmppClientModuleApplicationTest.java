@@ -813,7 +813,6 @@ class SmppClientModuleApplicationTest {
         Gateway tlsGateway = getSMPPGw();
         tlsGateway.setTlsEnabled(true);
 
-        setupAppPropertiesMocks();
         when(appProperties.getTlsTruststorePath()).thenReturn("");
 
         smppConnectionManager = new SmppConnectionManager(

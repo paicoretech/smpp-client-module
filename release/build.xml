@@ -7,7 +7,7 @@
     <property name="conf.dir" location="${release.dir}/conf" />
     <property name="logs.dir" location="${release.dir}/logs" />
     <property name="checkout.dir" value="${base.dir}/checkout" />
-    <property name="smpp.client.module.release.version" value="3.2.0-SNAPSHOT" />
+    <property name="smpp.client.module.release.version" value="3.3.0-SNAPSHOT" />
     <property name="checkout.smpp.client.module.dir" value="${base.dir}/.." />
 
     <property name="release.build.goals" value="clean install -Dmaven.test.skip=true" />

@@ -10,7 +10,7 @@
     </parent>
     <groupId>com.paicbd.smsc</groupId>
     <artifactId>smpp-client-module</artifactId>
-    <version>3.2.0-SNAPSHOT</version>
+    <version>3.3.0-SNAPSHOT</version>
     <name>smpp-client-module</name>
     <description>Demo project for Spring Boot</description>
     <licenses>
@@ -63,7 +63,7 @@
 
         <!-- Dependency versions -->
         <jsmpp.version>3.1.5</jsmpp.version>
-        <smsc-utils.version>3.1.0-87</smsc-utils.version>
+        <smsc-utils.version>3.1.0-OPEN-36</smsc-utils.version>
         <dsl-json.version>2.0.2</dsl-json.version>
         <mockito.version>5.12.0</mockito.version>
         <junit.jupiter.version>5.10.3</junit.jupiter.version>

@@ -104,6 +104,9 @@ public class AppProperties {
     @Value("${smsc.default.dlr.data-coding:0}")
     private int smscDefaultDlrDataCoding;
 
+    @Value("${smsc.generate.cdr.when.split-smsc:false}")
+    private boolean smscGenerateCdrWhenSplitSmsc;
+
     @Value("${smpp.client.tls.truststore.path:}")
     private String tlsTruststorePath;
 

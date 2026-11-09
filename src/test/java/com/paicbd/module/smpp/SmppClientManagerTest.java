@@ -9,9 +9,12 @@ import com.paicbd.smsc.exception.NoAvailableSessionException;
 import com.paicbd.smsc.kafka.KafkaConsumerFactory;
 import com.paicbd.smsc.kafka.KafkaTopicsConstants;
 import com.paicbd.smsc.scylla.ScyllaManager;
+import com.paicbd.smsc.utils.ChargingType;
+import com.paicbd.smsc.utils.ChargingUtils;
 import com.paicbd.smsc.utils.Converter;
 import com.paicbd.smsc.utils.ErrorCodes;
 import com.paicbd.smsc.utils.GeneralSmscConstants;
+import com.paicbd.smsc.utils.RequestDelivery;
 import com.paicbd.smsc.ws.SocketSession;
 import org.jsmpp.session.SMPPSession;
 import org.junit.jupiter.api.DisplayName;
@@ -730,5 +733,38 @@ class SmppClientManagerTest {
                 eq(30000L), //delay
                 eq(TimeUnit.MILLISECONDS)
         );
+    }
+
+    @Test
+    @DisplayName("An error on send publishes an ECUR charging completion")
+    void handleExceptionForErrorOnSendSubmitSmWhenEcurThenPublishesFailedChargingCompletion() throws Exception {
+        Gateway gateway = Gateway.builder()
+                .networkId(1)
+                .systemId("smpp-gateway")
+                .mno(1)
+                .protocol("SMPP")
+                .build();
+        MessageEvent messageEvent = new MessageEvent();
+        messageEvent.setId("1719421854353-1");
+        messageEvent.setMessageId("charging-reservation-id");
+        messageEvent.setChargingType(ChargingType.ECUR);
+        messageEvent.setSmscMessagePriority(GeneralSmscConstants.MEDIUM_PRIORITY);
+        messageEvent.setRegisteredDelivery(RequestDelivery.NON_REQUEST_DLR.getValue());
+
+        SmppConnectionManager manager = new SmppConnectionManager(redisManager, gateway, socketSession,
+                errorCodeMappingConcurrentHashMap, appProperties, scyllaManager, kafkaTemplate, kafkaConsumerFactory);
+        Method handleExceptionForErrorOnSendSubmitSm = SmppConnectionManager.class
+                .getDeclaredMethod("handleExceptionForErrorOnSendSubmitSm", MessageEvent.class, Exception.class);
+        handleExceptionForErrorOnSendSubmitSm.setAccessible(true);
+        handleExceptionForErrorOnSendSubmitSm.invoke(manager, messageEvent,
+                new NoAvailableSessionException("no session"));
+
+        ArgumentCaptor<String> chargingCaptor = ArgumentCaptor.forClass(String.class);
+        verify(kafkaTemplate).send(eq(KafkaTopicsConstants.CHARGING_COMPLETION_TOPIC), chargingCaptor.capture());
+        MessageEvent completionEvent = Converter.stringToObject(chargingCaptor.getValue(), MessageEvent.class);
+        assertEquals("charging-reservation-id", completionEvent.getMessageId());
+        assertNull(completionEvent.getStatus());
+        assertEquals(Map.of(ChargingUtils.CHARGING_SUCCESS_PARAM, false), completionEvent.getCustomParams());
+        assertEquals(ErrorCodes.SMPP_CONNECTION_UNAVAILABLE, completionEvent.getErrorCode());
     }
 }

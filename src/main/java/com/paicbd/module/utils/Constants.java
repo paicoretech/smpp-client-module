@@ -22,4 +22,8 @@ public class Constants {
     public static final String PARAM_UPDATE_STATUS = "status";
     public static final String PARAM_UPDATE_SESSIONS = "sessions";
     public static final String ORIGIN_GATEWAY_TYPE = "GW";
+
+    public static final String CDR_COMMENT = "cdr_comment";
+
+    public static final String SKIPPED_PART_COMMENT = "Message part skipped due to previous part failure";
 }
